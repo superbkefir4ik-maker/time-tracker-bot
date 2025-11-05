@@ -10,7 +10,7 @@ import sys
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 
@@ -20,33 +20,32 @@ logger = logging.getLogger(__name__)
 API_TOKEN = os.environ.get('BOT_TOKEN')
 
 if not API_TOKEN:
-    logger.error("❌ BOT_TOKEN not found in environment variables")
+    logger.error("❌ BOT_TOKEN not found")
     sys.exit(1)
 
-logger.info("✅ Environment variables loaded successfully")
+logger.info("✅ Bot token loaded")
 
 # Инициализация бота
 bot = telebot.TeleBot(API_TOKEN)
 
-# Состояния для FSM (Finite State Machine)
+# Состояния для FSM
 user_states = {}
 
 # ========== БАЗА ДАННЫХ SQLite ==========
 def get_db_connection():
     """Установка соединения с SQLite"""
     try:
-        conn = sqlite3.connect('time_tracker.db', check_same_thread=False)
+        conn = sqlite3.connect('/tmp/time_tracker.db', check_same_thread=False)
         conn.row_factory = sqlite3.Row
         return conn
     except Exception as e:
-        logger.error(f"❌ Database connection error: {e}")
+        logger.error(f"❌ Database error: {e}")
         return None
 
 def init_db():
     """Инициализация базы данных"""
     conn = get_db_connection()
     if not conn:
-        logger.error("❌ Cannot initialize database - no connection")
         return
         
     cur = conn.cursor()
@@ -57,7 +56,6 @@ def init_db():
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
-                first_day_date DATE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
@@ -71,10 +69,8 @@ def init_db():
                 category TEXT,
                 start_time TIMESTAMP,
                 end_time TIMESTAMP,
-                duration INTEGER,  -- в секундах
-                day_number INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users (user_id)
+                duration INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
@@ -83,30 +79,14 @@ def init_db():
             CREATE TABLE IF NOT EXISTS user_sessions (
                 user_id INTEGER PRIMARY KEY,
                 current_activity TEXT,
-                activity_start TIMESTAMP,
-                last_activity TEXT,
-                session_start TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users (user_id)
-            )
-        ''')
-        
-        # Таблица стриков
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS user_streaks (
-                user_id INTEGER PRIMARY KEY,
-                current_streak INTEGER DEFAULT 0,
-                longest_streak INTEGER DEFAULT 0,
-                last_activity_date DATE,
-                total_days INTEGER DEFAULT 0,
-                FOREIGN KEY (user_id) REFERENCES users (user_id)
+                activity_start TIMESTAMP
             )
         ''')
         
         conn.commit()
-        logger.info("✅ SQLite database initialized successfully")
+        logger.info("✅ Database initialized")
     except Exception as e:
-        logger.error(f"❌ Database initialization error: {e}")
-        conn.rollback()
+        logger.error(f"❌ Database init error: {e}")
     finally:
         cur.close()
         conn.close()
@@ -119,15 +99,11 @@ def register_user(user_id: int, username: str):
         
     cur = conn.cursor()
     try:
-        cur.execute('''
-            INSERT OR IGNORE INTO users (user_id, username) 
-            VALUES (?, ?)
-        ''', (user_id, username))
-        
+        cur.execute('INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)', (user_id, username))
         conn.commit()
         return True
     except Exception as e:
-        logger.error(f"Error registering user: {e}")
+        logger.error(f"Register error: {e}")
         return False
     finally:
         cur.close()
@@ -136,31 +112,23 @@ def register_user(user_id: int, username: str):
 def save_activity(user_id: int, activity_name: str, start_time: datetime, end_time: datetime):
     conn = get_db_connection()
     if not conn:
-        logger.error("❌ No database connection for save_activity")
         return False
         
     cur = conn.cursor()
     try:
-        # Определяем категорию
-        if activity_name.startswith("Другое:"):
-            category = "Другое"
-        else:
-            category = get_activity_category(activity_name)
-        
+        category = "Другое" if activity_name.startswith("Другое:") else get_activity_category(activity_name)
         duration = int((end_time - start_time).total_seconds())
-        day_number = 1  # Можно добавить логику для дней
         
         cur.execute('''
-            INSERT INTO activities (user_id, activity_name, category, start_time, end_time, duration, day_number)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (user_id, activity_name, category, start_time, end_time, duration, day_number))
+            INSERT INTO activities (user_id, activity_name, category, start_time, end_time, duration)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (user_id, activity_name, category, start_time, end_time, duration))
         
         conn.commit()
-        logger.info(f"✅ Activity saved to SQLite: {activity_name} for user {user_id}")
+        logger.info(f"✅ Saved: {activity_name} - {duration}s")
         return True
     except Exception as e:
-        logger.error(f"❌ Error saving activity: {e}")
-        conn.rollback()
+        logger.error(f"Save activity error: {e}")
         return False
     finally:
         cur.close()
@@ -169,7 +137,6 @@ def save_activity(user_id: int, activity_name: str, start_time: datetime, end_ti
 def get_activity_category(activity_name: str) -> str:
     """Определяет категорию активности"""
     categories = {
-        # Утренние
         "Проснулся": "Сон",
         "Полистал ленту": "Развлечения", 
         "В туалет": "Гигиена",
@@ -177,22 +144,17 @@ def get_activity_category(activity_name: str) -> str:
         "Завтрак": "Еда",
         "Одеваюсь": "Подготовка",
         "Домой": "Переход",
-        
-        # Дневные
         "Сесть за комп": "Компьютер",
         "Игры": "Игры",
         "Учеба/ДЗ": "Учеба", 
         "Обед/Ужин": "Еда",
         "Отдых": "Развлечения",
         "Уборка": "Бытовые",
-        
-        # Вечерние
         "Вечерняя гигиена": "Гигиена",
         "Лег в кровать": "Отдых",
         "Вечерний серфинг": "Развлечения", 
         "Спать": "Сон"
     }
-    
     return categories.get(activity_name, "Другое")
 
 def update_user_session(user_id: int, current_activity: str = None, activity_start: datetime = None):
@@ -203,24 +165,16 @@ def update_user_session(user_id: int, current_activity: str = None, activity_sta
     cur = conn.cursor()
     try:
         cur.execute('SELECT * FROM user_sessions WHERE user_id = ?', (user_id,))
-        existing = cur.fetchone()
-        
-        if existing:
-            cur.execute('''
-                UPDATE user_sessions 
-                SET current_activity = ?, activity_start = ?, last_activity = ?
-                WHERE user_id = ?
-            ''', (current_activity, activity_start, current_activity, user_id))
+        if cur.fetchone():
+            cur.execute('UPDATE user_sessions SET current_activity = ?, activity_start = ? WHERE user_id = ?', 
+                       (current_activity, activity_start, user_id))
         else:
-            cur.execute('''
-                INSERT INTO user_sessions (user_id, current_activity, activity_start, last_activity, session_start)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (user_id, current_activity, activity_start, current_activity, datetime.now()))
-        
+            cur.execute('INSERT INTO user_sessions (user_id, current_activity, activity_start) VALUES (?, ?, ?)', 
+                       (user_id, current_activity, activity_start))
         conn.commit()
         return True
     except Exception as e:
-        logger.error(f"Error updating session: {e}")
+        logger.error(f"Session update error: {e}")
         return False
     finally:
         cur.close()
@@ -234,51 +188,13 @@ def get_user_session(user_id: int):
     cur = conn.cursor()
     try:
         cur.execute('SELECT * FROM user_sessions WHERE user_id = ?', (user_id,))
-        result = cur.fetchone()
-        return result
+        return cur.fetchone()
     except Exception as e:
-        logger.error(f"Error getting session: {e}")
+        logger.error(f"Get session error: {e}")
         return None
     finally:
         cur.close()
         conn.close()
-
-# ========== ОСНОВНОЙ ФУНКЦИОНАЛ БОТА ==========
-def handle_activity_start(message, activity_name: str):
-    """Обработчик начала активности"""
-    user_id = message.from_user.id
-    current_time = datetime.now()
-    
-    # Регистрируем пользователя если нужно
-    register_user(user_id, message.from_user.username)
-    
-    # Получаем текущую сессию
-    session = get_user_session(user_id)
-    
-    # Если есть текущая активность, сохраняем ее
-    if session and session['current_activity']:
-        previous_start = datetime.fromisoformat(session['activity_start']) if session['activity_start'] else None
-        if previous_start:
-            save_activity(user_id, session['current_activity'], previous_start, current_time)
-            
-            # Отправляем сообщение о завершении
-            duration = current_time - previous_start
-            minutes = int(duration.total_seconds() // 60)
-            seconds = int(duration.total_seconds() % 60)
-            
-            bot.send_message(
-                message.chat.id, 
-                f"✅ Завершено: {session['current_activity']}\n⏰ Время: {minutes}м {seconds}с"
-            )
-    
-    # Начинаем новую активность
-    update_user_session(user_id, activity_name, current_time)
-    
-    bot.send_message(
-        message.chat.id, 
-        f"🔄 Начато: {activity_name}\n🕐 {current_time.strftime('%H:%M:%S')}",
-        reply_markup=main_menu_keyboard()
-    )
 
 # ========== КЛАВИАТУРЫ ==========
 def main_menu_keyboard():
@@ -333,63 +249,69 @@ def evening_keyboard():
     return keyboard
 
 def other_activity_keyboard():
-    """Клавиатура для отмены ввода своей активности"""
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
     keyboard.add(KeyboardButton("❌ Отмена"))
     return keyboard
 
+# ========== ОСНОВНОЙ ФУНКЦИОНАЛ ==========
+def handle_activity_start(message, activity_name: str):
+    user_id = message.from_user.id
+    current_time = datetime.now()
+    
+    register_user(user_id, message.from_user.username)
+    
+    session = get_user_session(user_id)
+    
+    # Завершаем предыдущую активность
+    if session and session['current_activity'] and session['activity_start']:
+        previous_start = datetime.fromisoformat(session['activity_start'])
+        save_activity(user_id, session['current_activity'], previous_start, current_time)
+        
+        duration = current_time - previous_start
+        minutes = int(duration.total_seconds() // 60)
+        seconds = int(duration.total_seconds() % 60)
+        
+        bot.send_message(message.chat.id, f"✅ Завершено: {session['current_activity']}\n⏰ Время: {minutes}м {seconds}с")
+    
+    # Начинаем новую активность
+    update_user_session(user_id, activity_name, current_time)
+    bot.send_message(message.chat.id, f"🔄 Начато: {activity_name}\n🕐 {current_time.strftime('%H:%M:%S')}", reply_markup=main_menu_keyboard())
+
 # ========== ОБРАБОТЧИКИ КОМАНД ==========
 @bot.message_handler(commands=['start'])
 def start_command(message):
-    user_id = message.from_user.id
-    register_user(user_id, message.from_user.username)
-    
-    welcome_text = (
-        "🏠 Привет! Я бот для учета твоего времени.\n\n"
-        "✅ Теперь я работаю 24/7 с ПОСТОЯННЫМ хранилищем! 💾\n"
-        "📝 Есть кнопка 'Другое' для своих активностей!\n"
-        "📊 Все данные сохраняются в базу SQLite!\n\n"
-        "Выбирай раздел и начинай отслеживать!"
+    register_user(message.from_user.id, message.from_user.username)
+    bot.send_message(message.chat.id, 
+        "🏠 Привет! Я бот для учета времени.\n\n"
+        "✅ Работаю 24/7 с постоянным хранилищем!\n"
+        "📝 Есть кнопка 'Другое' для своих активностей!\n\n"
+        "Выбирай раздел и начинай отслеживать!",
+        reply_markup=main_menu_keyboard()
     )
-    
-    bot.send_message(message.chat.id, welcome_text, reply_markup=main_menu_keyboard())
 
 @bot.message_handler(func=lambda message: message.text == "📋 Главное меню")
 def main_menu(message):
-    user_id = message.from_user.id
-    if user_id in user_states:
-        del user_states[user_id]  # Сбрасываем состояние
+    if message.from_user.id in user_states:
+        del user_states[message.from_user.id]
     bot.send_message(message.chat.id, "📋 Главное меню:", reply_markup=main_menu_keyboard())
 
-@bot.message_handler(func=lambda message: message.text == "🌅 Утро")
-def morning_menu(message):
+@bot.message_handler(func=lambda message: message.text in ["🌅 Утро", "💻 День", "🌙 Вечер"])
+def time_menu(message):
     user_id = message.from_user.id
     if user_id in user_states:
-        del user_states[user_id]  # Сбрасываем состояние
-    bot.send_message(message.chat.id, "🌅 Утренние активности:", reply_markup=morning_keyboard())
-
-@bot.message_handler(func=lambda message: message.text == "💻 День")
-def day_menu(message):
-    user_id = message.from_user.id
-    if user_id in user_states:
-        del user_states[user_id]  # Сбрасываем состояние
-    bot.send_message(message.chat.id, "💻 Дневные активности:", reply_markup=day_keyboard())
-
-@bot.message_handler(func=lambda message: message.text == "🌙 Вечер")
-def evening_menu(message):
-    user_id = message.from_user.id
-    if user_id in user_states:
-        del user_states[user_id]  # Сбрасываем состояние
-    bot.send_message(message.chat.id, "🌙 Вечерние активности:", reply_markup=evening_keyboard())
+        del user_states[user_id]
+    
+    if message.text == "🌅 Утро":
+        bot.send_message(message.chat.id, "🌅 Утренние активности:", reply_markup=morning_keyboard())
+    elif message.text == "💻 День":
+        bot.send_message(message.chat.id, "💻 Дневные активности:", reply_markup=day_keyboard())
+    else:
+        bot.send_message(message.chat.id, "🌙 Вечерние активности:", reply_markup=evening_keyboard())
 
 @bot.message_handler(func=lambda message: message.text == "📝 Другое")
 def other_activity(message):
-    """Обработчик кнопки Другое"""
-    user_id = message.from_user.id
-    user_states[user_id] = "waiting_for_activity"
-    
-    bot.send_message(
-        message.chat.id,
+    user_states[message.from_user.id] = "waiting_for_activity"
+    bot.send_message(message.chat.id,
         "📝 Напиши свою активность текстом:\n\n"
         "Например: 'Читал книгу', 'Готовил ужин', 'Занимался спортом'\n"
         "Или нажми '❌ Отмена' чтобы вернуться назад",
@@ -398,38 +320,21 @@ def other_activity(message):
 
 @bot.message_handler(func=lambda message: message.text == "❌ Отмена")
 def cancel_other_activity(message):
-    """Отмена ввода своей активности"""
-    user_id = message.from_user.id
-    if user_id in user_states:
-        del user_states[user_id]
-    
-    bot.send_message(
-        message.chat.id,
-        "❌ Ввод активности отменен",
-        reply_markup=main_menu_keyboard()
-    )
+    if message.from_user.id in user_states:
+        del user_states[message.from_user.id]
+    bot.send_message(message.chat.id, "❌ Ввод активности отменен", reply_markup=main_menu_keyboard())
 
 @bot.message_handler(func=lambda message: message.from_user.id in user_states and user_states[message.from_user.id] == "waiting_for_activity")
 def handle_custom_activity(message):
-    """Обработчик введенной пользователем активности"""
     user_id = message.from_user.id
     custom_activity = message.text.strip()
     
     if len(custom_activity) > 100:
-        bot.send_message(
-            message.chat.id,
-            "❌ Слишком длинное название активности (максимум 100 символов)\nПопробуй еще раз:",
-            reply_markup=other_activity_keyboard()
-        )
+        bot.send_message(message.chat.id, "❌ Слишком длинное название (максимум 100 символов)", reply_markup=other_activity_keyboard())
         return
     
-    # Форматируем активность
     formatted_activity = f"Другое: {custom_activity}"
-    
-    # Удаляем состояние
     del user_states[user_id]
-    
-    # Обрабатываем как обычную активность
     handle_activity_start(message, formatted_activity)
 
 @bot.message_handler(func=lambda message: message.text == "📊 Статистика")
@@ -442,7 +347,7 @@ def show_statistics(message):
         
     cur = conn.cursor()
     try:
-        # Статистика по категориям за сегодня
+        # Статистика за сегодня
         cur.execute('''
             SELECT category, SUM(duration) as total_time
             FROM activities 
@@ -477,14 +382,9 @@ def show_statistics(message):
         total_hours = int(total_minutes // 60)
         remaining_minutes = total_minutes % 60
         
-        if total_hours > 0:
-            total_time_str = f"{total_hours}ч {remaining_minutes}м"
-        else:
-            total_time_str = f"{total_minutes}м"
-            
-        stats_text += f"\n🕐 **Всего времени**: {total_time_str}"
+        stats_text += f"\n🕐 **Всего времени**: {total_hours}ч {remaining_minutes}м" if total_hours > 0 else f"\n🕐 **Всего времени**: {total_minutes}м"
         
-        # Показываем отдельно активности из категории "Другое"
+        # Свои активности
         cur.execute('''
             SELECT activity_name, SUM(duration) as total_time
             FROM activities 
@@ -499,21 +399,20 @@ def show_statistics(message):
             stats_text += "\n\n**📝 Свои активности:**\n"
             for activity, duration in other_activities:
                 if duration:
-                    seconds = duration
-                    minutes = int(seconds // 60)
+                    minutes = int(duration // 60)
                     activity_name = activity.replace("Другое: ", "")
                     stats_text += f"• {activity_name}: {minutes}м\n"
         
         bot.send_message(message.chat.id, stats_text)
         
     except Exception as e:
-        logger.error(f"Error getting statistics: {e}")
+        logger.error(f"Statistics error: {e}")
         bot.send_message(message.chat.id, "❌ Ошибка при получении статистики")
     finally:
         cur.close()
         conn.close()
 
-# ========== ОБРАБОТЧИКИ СТАНДАРТНЫХ АКТИВНОСТЕЙ ==========
+# Обработчики стандартных активностей
 activities = [
     "⏰ Проснулся", "📱 Полистал ленту", "🚽 В туалет", "🚿 Гигиена", 
     "🍳 Завтрак", "👔 Одеваюсь", "🏠 Домой", "💻 Сесть за комп",
@@ -524,25 +423,28 @@ activities = [
 for activity in activities:
     @bot.message_handler(func=lambda message, act=activity: message.text == act)
     def activity_handler(message, act=activity):
-        # Убираем эмодзи для сохранения в БД
         clean_activity = act.split(' ', 1)[1] if ' ' in act else act
         handle_activity_start(message, clean_activity)
 
 # ========== ЗАПУСК БОТА ==========
 def run_bot():
-    """Запуск бота с переподключением при ошибках"""
-    logger.info("🔄 Initializing SQLite database...")
+    """Запуск бота с обработкой ошибок"""
+    logger.info("🔄 Initializing database...")
     init_db()
     
-    logger.info("🚀 Starting Time Tracker Bot 24/7 with SQLite...")
+    logger.info("🚀 Starting bot...")
     
     while True:
         try:
             logger.info("🤖 Bot polling started...")
-            bot.polling(none_stop=True, interval=1, timeout=60)
+            bot.polling(none_stop=True, interval=2, timeout=30)
         except Exception as e:
-            logger.error(f"❌ Bot error: {e}")
-            logger.info("🔄 Restarting bot in 10 seconds...")
+            if "Conflict" in str(e) or "409" in str(e):
+                logger.warning("⚠️ Another bot instance detected, waiting...")
+                time.sleep(30)
+            else:
+                logger.error(f"❌ Bot error: {e}")
+            logger.info("🔄 Restarting in 10 seconds...")
             time.sleep(10)
 
 if __name__ == "__main__":
