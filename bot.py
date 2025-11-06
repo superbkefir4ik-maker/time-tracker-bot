@@ -5,6 +5,9 @@ from datetime import datetime, timedelta
 import os
 import logging
 import time
+import atexit
+import signal
+import sys
 
 # Настройка логирования
 logging.basicConfig(
@@ -16,7 +19,6 @@ logger = logging.getLogger(__name__)
 
 # Получение переменных окружения
 API_TOKEN = os.environ.get('BOT_TOKEN')
-WEBHOOK_URL = os.environ.get('RENDER_EXTERNAL_URL')  # Render автоматически дает этот URL
 
 if not API_TOKEN:
     logger.error("❌ BOT_TOKEN not found")
@@ -72,7 +74,8 @@ def init_db():
             CREATE TABLE IF NOT EXISTS user_sessions (
                 user_id INTEGER PRIMARY KEY,
                 current_activity TEXT,
-                activity_start TIMESTAMP
+                activity_start TIMESTAMP,
+                last_update TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
@@ -83,6 +86,51 @@ def init_db():
     finally:
         cur.close()
         conn.close()
+
+# ========== АВТОСОХРАНЕНИЕ ПРИ ПАДЕНИИ ==========
+def save_current_activity_on_exit():
+    """Сохраняет текущие активности при выходе"""
+    logger.info("💾 Saving active sessions before exit...")
+    conn = get_db_connection()
+    if not conn:
+        return
+        
+    cur = conn.cursor()
+    try:
+        cur.execute('SELECT * FROM user_sessions WHERE current_activity IS NOT NULL')
+        active_sessions = cur.fetchall()
+        
+        for session in active_sessions:
+            user_id = session['user_id']
+            activity_name = session['current_activity']
+            activity_start = datetime.fromisoformat(session['activity_start'])
+            end_time = datetime.now()
+            
+            duration = int((end_time - activity_start).total_seconds())
+            category = "Другое" if activity_name.startswith("Другое:") else get_activity_category(activity_name)
+            
+            cur.execute('''
+                INSERT INTO activities (user_id, activity_name, category, start_time, end_time, duration)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (user_id, activity_name, category, activity_start, end_time, duration))
+            
+            logger.info(f"💾 Auto-saved: {activity_name} for user {user_id}")
+        
+        # Очищаем сессии
+        cur.execute('UPDATE user_sessions SET current_activity = NULL, activity_start = NULL')
+        conn.commit()
+        logger.info("✅ All active sessions saved")
+        
+    except Exception as e:
+        logger.error(f"❌ Error saving sessions: {e}")
+    finally:
+        cur.close()
+        conn.close()
+
+# Регистрируем обработчики для сохранения при выходе
+atexit.register(save_current_activity_on_exit)
+signal.signal(signal.SIGTERM, lambda signum, frame: save_current_activity_on_exit())
+signal.signal(signal.SIGINT, lambda signum, frame: save_current_activity_on_exit())
 
 # ========== ФУНКЦИИ ДЛЯ РАБОТЫ С ДАННЫМИ ==========
 def register_user(user_id: int, username: str):
@@ -106,7 +154,7 @@ def save_activity(user_id: int, activity_name: str, start_time: datetime, end_ti
         cur.execute('INSERT INTO activities (user_id, activity_name, category, start_time, end_time, duration) VALUES (?, ?, ?, ?, ?, ?)', 
                    (user_id, activity_name, category, start_time, end_time, duration))
         conn.commit()
-        logger.info(f"✅ Saved: {activity_name}")
+        logger.info(f"✅ Saved: {activity_name} - {duration}s")
         return True
     except Exception as e:
         logger.error(f"Save error: {e}")
@@ -120,7 +168,8 @@ def get_activity_category(activity_name: str) -> str:
         "Сесть за комп": "Компьютер", "Игры": "Игры", "Учеба/ДЗ": "Учеба", 
         "Обед/Ужин": "Еда", "Отдых": "Развлечения", "Уборка": "Бытовые",
         "Вечерняя гигиена": "Гигиена", "Лег в кровать": "Отдых", 
-        "Вечерний серфинг": "Развлечения", "Спать": "Сон"
+        "Вечерний серфинг": "Развлечения", "Спать": "Сон",
+        "Выхожу на учебу": "Учеба", "Иду гулять": "Отдых", "Время с близкими": "Социальное"
     }
     return categories.get(activity_name, "Другое")
 
@@ -131,11 +180,11 @@ def update_user_session(user_id: int, current_activity: str = None, activity_sta
     try:
         cur.execute('SELECT * FROM user_sessions WHERE user_id = ?', (user_id,))
         if cur.fetchone():
-            cur.execute('UPDATE user_sessions SET current_activity = ?, activity_start = ? WHERE user_id = ?', 
-                       (current_activity, activity_start, user_id))
+            cur.execute('UPDATE user_sessions SET current_activity = ?, activity_start = ?, last_update = ? WHERE user_id = ?', 
+                       (current_activity, activity_start, datetime.now(), user_id))
         else:
-            cur.execute('INSERT INTO user_sessions (user_id, current_activity, activity_start) VALUES (?, ?, ?)', 
-                       (user_id, current_activity, activity_start))
+            cur.execute('INSERT INTO user_sessions (user_id, current_activity, activity_start, last_update) VALUES (?, ?, ?, ?)', 
+                       (user_id, current_activity, activity_start, datetime.now()))
         conn.commit()
         return True
     except: return False
@@ -163,8 +212,8 @@ def morning_keyboard():
     keyboard.add(KeyboardButton("⏰ Проснулся"), KeyboardButton("📱 Полистал ленту"),
                  KeyboardButton("🚽 В туалет"), KeyboardButton("🚿 Гигиена"),
                  KeyboardButton("🍳 Завтрак"), KeyboardButton("👔 Одеваюсь"),
-                 KeyboardButton("🏠 Домой"), KeyboardButton("📝 Другое"),
-                 KeyboardButton("📋 Главное меню"))
+                 KeyboardButton("🎒 Выхожу на учебу"), KeyboardButton("🏠 Домой"))
+    keyboard.add(KeyboardButton("📝 Другое"), KeyboardButton("📋 Главное меню"))
     return keyboard
 
 def day_keyboard():
@@ -172,7 +221,8 @@ def day_keyboard():
     keyboard.add(KeyboardButton("💻 Сесть за комп"), KeyboardButton("🎮 Игры"),
                  KeyboardButton("📚 Учеба/ДЗ"), KeyboardButton("🍽️ Обед/Ужин"),
                  KeyboardButton("📺 Отдых"), KeyboardButton("🧹 Уборка"),
-                 KeyboardButton("📝 Другое"), KeyboardButton("📋 Главное меню"))
+                 KeyboardButton("🚶 Иду гулять"), KeyboardButton("👨‍👩‍👧‍👦 Время с близкими"))
+    keyboard.add(KeyboardButton("📝 Другое"), KeyboardButton("📋 Главное меню"))
     return keyboard
 
 def evening_keyboard():
@@ -210,8 +260,9 @@ def start_command(message):
     register_user(message.from_user.id, message.from_user.username)
     bot.send_message(message.chat.id, 
         "🏠 Привет! Я бот для учета времени.\n\n"
-        "✅ Работаю 24/7 с постоянным хранилищем!\n"
-        "📝 Есть кнопка 'Другое' для своих активностей!\n\n"
+        "✅ Работаю 24/7 с защитой от падений!\n"
+        "📝 Есть кнопка 'Другое' для своих активностей!\n"
+        "💾 Автосохранение при перезапуске!\n\n"
         "Выбирай раздел и начинай отслеживать!",
         reply_markup=main_menu_keyboard()
     )
@@ -297,7 +348,13 @@ def show_statistics(message):
     finally: cur.close(); conn.close()
 
 # Обработчики стандартных активностей
-activities = ["⏰ Проснулся", "📱 Полистал ленту", "🚽 В туалет", "🚿 Гигиена", "🍳 Завтрак", "👔 Одеваюсь", "🏠 Домой", "💻 Сесть за комп", "🎮 Игры", "📚 Учеба/ДЗ", "🍽️ Обед/Ужин", "📺 Отдых", "🧹 Уборка", "🚿 Вечерняя гигиена", "🛏️ Лег в кровать", "📱 Вечерний серфинг", "💤 Спать"]
+activities = [
+    "⏰ Проснулся", "📱 Полистал ленту", "🚽 В туалет", "🚿 Гигиена", 
+    "🍳 Завтрак", "👔 Одеваюсь", "🎒 Выхожу на учебу", "🏠 Домой", 
+    "💻 Сесть за комп", "🎮 Игры", "📚 Учеба/ДЗ", "🍽️ Обед/Ужин", 
+    "📺 Отдых", "🧹 Уборка", "🚶 Иду гулять", "👨‍👩‍👧‍👦 Время с близкими",
+    "🚿 Вечерняя гигиена", "🛏️ Лег в кровать", "📱 Вечерний серфинг", "💤 Спать"
+]
 
 for activity in activities:
     @bot.message_handler(func=lambda message, act=activity: message.text == act)
@@ -305,48 +362,26 @@ for activity in activities:
         clean_activity = act.split(' ', 1)[1] if ' ' in act else act
         handle_activity_start(message, clean_activity)
 
-# ========== WEBHOOK РЕЖИМ (для Render) ==========
-if WEBHOOK_URL:
-    from flask import Flask, request
+# ========== ЗАПУСК БОТА С ЗАЩИТОЙ ==========
+def run_bot():
+    """Запуск бота с защитой от падений"""
+    init_db()
+    logger.info("🚀 Starting bot with crash protection...")
     
-    app = Flask(__name__)
-    
-    @app.route('/')
-    def index():
-        return "Bot is running!"
-    
-    @app.route('/webhook', methods=['POST'])
-    def webhook():
-        if request.headers.get('content-type') == 'application/json':
-            json_string = request.get_data().decode('utf-8')
-            update = telebot.types.Update.de_json(json_string)
-            bot.process_new_updates([update])
-            return ''
-        else:
-            return 'Invalid content type', 400
-    
-    def run_webhook():
-        init_db()
-        bot.remove_webhook()
-        time.sleep(1)
-        bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
-        logger.info(f"✅ Webhook set: {WEBHOOK_URL}/webhook")
-        app.run(host='0.0.0.0', port=10000)
-    
-    if __name__ == '__main__':
-        run_webhook()
+    while True:
+        try:
+            logger.info("🤖 Bot polling started...")
+            bot.infinity_polling(timeout=30, long_polling_timeout=10)
+        except Exception as e:
+            if "Conflict" in str(e) or "409" in str(e):
+                logger.warning("⚠️ Another instance detected, waiting 60s...")
+                time.sleep(60)
+            else:
+                logger.error(f"❌ Bot error: {e}")
+                # Сохраняем активные сессии при ошибке
+                save_current_activity_on_exit()
+            logger.info("🔄 Restarting in 15 seconds...")
+            time.sleep(15)
 
-else:
-    # Polling режим для локальной разработки
-    def run_polling():
-        init_db()
-        logger.info("🚀 Starting bot with polling...")
-        while True:
-            try:
-                bot.infinity_polling(timeout=30, long_polling_timeout=10)
-            except Exception as e:
-                logger.error(f"❌ Polling error: {e}")
-                time.sleep(10)
-    
-    if __name__ == '__main__':
-        run_polling()
+if __name__ == "__main__":
+    run_bot()
