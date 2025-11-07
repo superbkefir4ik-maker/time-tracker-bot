@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 # Получение переменных окружения
 API_TOKEN = os.environ.get('BOT_TOKEN')
 PORT = int(os.environ.get('PORT', 10000))
+WEBHOOK_URL = os.environ.get('WEBHOOK_URL', '')
 
 if not API_TOKEN:
     logger.error("❌ BOT_TOKEN not found")
@@ -516,25 +517,24 @@ def webhook():
         return ''
     return 'Invalid content type', 400
 
-def run_bot_polling():
-    init_db()
-    logger.info("🚀 Starting bot polling in background...")
-    
-    while True:
+def set_webhook():
+    """Устанавливает webhook для бота"""
+    if WEBHOOK_URL:
         try:
-            bot.infinity_polling(timeout=30, long_polling_timeout=10)
+            bot.remove_webhook()
+            time.sleep(1)
+            bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
+            logger.info(f"✅ Webhook set to: {WEBHOOK_URL}/webhook")
         except Exception as e:
-            logger.error(f"❌ Bot polling error: {e}")
-            time.sleep(15)
+            logger.error(f"❌ Webhook setup error: {e}")
 
 def run_flask():
+    """Запускает Flask сервер"""
     logger.info(f"🌐 Starting Flask server on port {PORT}...")
+    init_db()
+    set_webhook()
     app.run(host='0.0.0.0', port=PORT, debug=False)
 
 if __name__ == "__main__":
-    # Запускаем бот в фоновом потоке
-    bot_thread = threading.Thread(target=run_bot_polling, daemon=True)
-    bot_thread.start()
-    
-    # Запускаем Flask в основном потоке
+    # На Render используем только webhook режим
     run_flask()

@@ -8,3 +8,8 @@ services:
     envVars:
       - key: BOT_TOKEN
         value: 8525868851:AAHPwFEvob0vL1EdYt7dACLYVGBCVyuXreg
+      - key: WEBHOOK_URL
+        fromService:
+          type: web
+          name: time-tracker-bot
+          property: urleg
