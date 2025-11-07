@@ -5,9 +5,9 @@ from datetime import datetime, timedelta
 import os
 import logging
 import time
-import atexit
-import signal
-import sys
+import threading
+from flask import Flask, request, jsonify
+import pytz
 
 # Настройка логирования
 logging.basicConfig(
@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 # Получение переменных окружения
 API_TOKEN = os.environ.get('BOT_TOKEN')
+PORT = int(os.environ.get('PORT', 10000))
 
 if not API_TOKEN:
     logger.error("❌ BOT_TOKEN not found")
@@ -26,13 +27,17 @@ if not API_TOKEN:
 
 logger.info("✅ Bot token loaded")
 
-# Инициализация бота
+# Московский часовой пояс
+MOSCOW_TZ = pytz.timezone('Europe/Moscow')
+
+# Инициализация бота и Flask
 bot = telebot.TeleBot(API_TOKEN)
+app = Flask(__name__)
 
 # Состояния для FSM
 user_states = {}
 
-# ========== БАЗА ДАННЫХ SQLite ==========
+# ========== БАЗА ДАННЫХ ==========
 def get_db_connection():
     try:
         conn = sqlite3.connect('/tmp/time_tracker.db', check_same_thread=False)
@@ -44,8 +49,7 @@ def get_db_connection():
 
 def init_db():
     conn = get_db_connection()
-    if not conn:
-        return
+    if not conn: return
         
     cur = conn.cursor()
     try:
@@ -56,7 +60,6 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        
         cur.execute('''
             CREATE TABLE IF NOT EXISTS activities (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,16 +72,13 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        
         cur.execute('''
             CREATE TABLE IF NOT EXISTS user_sessions (
                 user_id INTEGER PRIMARY KEY,
                 current_activity TEXT,
-                activity_start TIMESTAMP,
-                last_update TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                activity_start TIMESTAMP
             )
         ''')
-        
         conn.commit()
         logger.info("✅ Database initialized")
     except Exception as e:
@@ -87,52 +87,44 @@ def init_db():
         cur.close()
         conn.close()
 
-# ========== АВТОСОХРАНЕНИЕ ПРИ ПАДЕНИИ ==========
-def save_current_activity_on_exit():
-    """Сохраняет текущие активности при выходе"""
-    logger.info("💾 Saving active sessions before exit...")
-    conn = get_db_connection()
-    if not conn:
-        return
-        
-    cur = conn.cursor()
-    try:
-        cur.execute('SELECT * FROM user_sessions WHERE current_activity IS NOT NULL')
-        active_sessions = cur.fetchall()
-        
-        for session in active_sessions:
-            user_id = session['user_id']
-            activity_name = session['current_activity']
-            activity_start = datetime.fromisoformat(session['activity_start'])
-            end_time = datetime.now()
-            
-            duration = int((end_time - activity_start).total_seconds())
-            category = "Другое" if activity_name.startswith("Другое:") else get_activity_category(activity_name)
-            
-            cur.execute('''
-                INSERT INTO activities (user_id, activity_name, category, start_time, end_time, duration)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (user_id, activity_name, category, activity_start, end_time, duration))
-            
-            logger.info(f"💾 Auto-saved: {activity_name} for user {user_id}")
-        
-        # Очищаем сессии
-        cur.execute('UPDATE user_sessions SET current_activity = NULL, activity_start = NULL')
-        conn.commit()
-        logger.info("✅ All active sessions saved")
-        
-    except Exception as e:
-        logger.error(f"❌ Error saving sessions: {e}")
-    finally:
-        cur.close()
-        conn.close()
-
-# Регистрируем обработчики для сохранения при выходе
-atexit.register(save_current_activity_on_exit)
-signal.signal(signal.SIGTERM, lambda signum, frame: save_current_activity_on_exit())
-signal.signal(signal.SIGINT, lambda signum, frame: save_current_activity_on_exit())
-
 # ========== ФУНКЦИИ ДЛЯ РАБОТЫ С ДАННЫМИ ==========
+def get_moscow_time():
+    """Возвращает текущее московское время"""
+    return datetime.now(MOSCOW_TZ)
+
+def format_moscow_time(dt=None):
+    """Форматирует время в московский формат"""
+    if dt is None:
+        dt = get_moscow_time()
+    elif dt.tzinfo is None:
+        dt = MOSCOW_TZ.localize(dt)
+    return dt.strftime('%H:%M:%S')
+
+def parse_time_input(time_str):
+    """Парсит ввод времени пользователя"""
+    try:
+        # Пробуем разные форматы времени
+        time_formats = ['%H:%M', '%H:%M:%S', '%H.%M', '%H.%M.%S']
+        
+        for fmt in time_formats:
+            try:
+                # Создаем naive datetime с сегодняшней датой
+                naive_dt = datetime.strptime(time_str, fmt)
+                # Добавляем московский часовой пояс
+                localized_dt = MOSCOW_TZ.localize(naive_dt.replace(
+                    year=get_moscow_time().year,
+                    month=get_moscow_time().month, 
+                    day=get_moscow_time().day
+                ))
+                return localized_dt
+            except ValueError:
+                continue
+                
+        return None
+    except Exception as e:
+        logger.error(f"Time parse error: {e}")
+        return None
+
 def register_user(user_id: int, username: str):
     conn = get_db_connection()
     if not conn: return False
@@ -180,11 +172,11 @@ def update_user_session(user_id: int, current_activity: str = None, activity_sta
     try:
         cur.execute('SELECT * FROM user_sessions WHERE user_id = ?', (user_id,))
         if cur.fetchone():
-            cur.execute('UPDATE user_sessions SET current_activity = ?, activity_start = ?, last_update = ? WHERE user_id = ?', 
-                       (current_activity, activity_start, datetime.now(), user_id))
+            cur.execute('UPDATE user_sessions SET current_activity = ?, activity_start = ? WHERE user_id = ?', 
+                       (current_activity, activity_start, user_id))
         else:
-            cur.execute('INSERT INTO user_sessions (user_id, current_activity, activity_start, last_update) VALUES (?, ?, ?, ?)', 
-                       (user_id, current_activity, activity_start, datetime.now()))
+            cur.execute('INSERT INTO user_sessions (user_id, current_activity, activity_start) VALUES (?, ?, ?)', 
+                       (user_id, current_activity, activity_start))
         conn.commit()
         return True
     except: return False
@@ -203,46 +195,71 @@ def get_user_session(user_id: int):
 # ========== КЛАВИАТУРЫ ==========
 def main_menu_keyboard():
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    keyboard.add(KeyboardButton("🌅 Утро"), KeyboardButton("💻 День"), 
-                 KeyboardButton("🌙 Вечер"), KeyboardButton("📊 Статистика"))
+    keyboard.add(
+        KeyboardButton("🌅 Утро"), KeyboardButton("💻 День"), 
+        KeyboardButton("🌙 Вечер"), KeyboardButton("📊 Статистика"),
+        KeyboardButton("⏰ Добавить прошлое действие")
+    )
     return keyboard
 
 def morning_keyboard():
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    keyboard.add(KeyboardButton("⏰ Проснулся"), KeyboardButton("📱 Полистал ленту"),
-                 KeyboardButton("🚽 В туалет"), KeyboardButton("🚿 Гигиена"),
-                 KeyboardButton("🍳 Завтрак"), KeyboardButton("👔 Одеваюсь"),
-                 KeyboardButton("🎒 Выхожу на учебу"), KeyboardButton("🏠 Домой"))
+    keyboard.add(
+        KeyboardButton("⏰ Проснулся"), KeyboardButton("📱 Полистал ленту"),
+        KeyboardButton("🚽 В туалет"), KeyboardButton("🚿 Гигиена"),
+        KeyboardButton("🍳 Завтрак"), KeyboardButton("👔 Одеваюсь"),
+        KeyboardButton("🎒 Выхожу на учебу"), KeyboardButton("🏠 Домой"))
     keyboard.add(KeyboardButton("📝 Другое"), KeyboardButton("📋 Главное меню"))
     return keyboard
 
 def day_keyboard():
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    keyboard.add(KeyboardButton("💻 Сесть за комп"), KeyboardButton("🎮 Игры"),
-                 KeyboardButton("📚 Учеба/ДЗ"), KeyboardButton("🍽️ Обед/Ужин"),
-                 KeyboardButton("📺 Отдых"), KeyboardButton("🧹 Уборка"),
-                 KeyboardButton("🚶 Иду гулять"), KeyboardButton("👨‍👩‍👧‍👦 Время с близкими"))
+    keyboard.add(
+        KeyboardButton("💻 Сесть за комп"), KeyboardButton("🎮 Игры"),
+        KeyboardButton("📚 Учеба/ДЗ"), KeyboardButton("🍽️ Обед/Ужин"),
+        KeyboardButton("📺 Отдых"), KeyboardButton("🧹 Уборка"),
+        KeyboardButton("🚶 Иду гулять"), KeyboardButton("👨‍👩‍👧‍👦 Время с близкими"))
     keyboard.add(KeyboardButton("📝 Другое"), KeyboardButton("📋 Главное меню"))
     return keyboard
 
 def evening_keyboard():
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    keyboard.add(KeyboardButton("🚿 Вечерняя гигиена"), KeyboardButton("🛏️ Лег в кровать"), 
-                 KeyboardButton("📱 Вечерний серфинг"), KeyboardButton("💤 Спать"),
-                 KeyboardButton("📝 Другое"), KeyboardButton("📋 Главное меню"))
+    keyboard.add(
+        KeyboardButton("🚿 Вечерняя гигиена"), KeyboardButton("🛏️ Лег в кровать"), 
+        KeyboardButton("📱 Вечерний серфинг"), KeyboardButton("💤 Спать"))
+    keyboard.add(KeyboardButton("📝 Другое"), KeyboardButton("📋 Главное меню"))
     return keyboard
 
 def other_activity_keyboard():
     return ReplyKeyboardMarkup(resize_keyboard=True).add(KeyboardButton("❌ Отмена"))
 
+def past_activity_keyboard():
+    """Клавиатура для выбора действия при добавлении прошлого действия"""
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    keyboard.add(
+        KeyboardButton("⏰ Проснулся"), KeyboardButton("📱 Полистал ленту"),
+        KeyboardButton("🚽 В туалет"), KeyboardButton("🚿 Гигиена"),
+        KeyboardButton("🍳 Завтрак"), KeyboardButton("👔 Одеваюсь"),
+        KeyboardButton("🎒 Выхожу на учебу"), KeyboardButton("🏠 Домой"),
+        KeyboardButton("💻 Сесть за комп"), KeyboardButton("🎮 Игры"),
+        KeyboardButton("📚 Учеба/ДЗ"), KeyboardButton("🍽️ Обед/Ужин"),
+        KeyboardButton("📺 Отдых"), KeyboardButton("🧹 Уборка"),
+        KeyboardButton("🚶 Иду гулять"), KeyboardButton("👨‍👩‍👧‍👦 Время с близкими"),
+        KeyboardButton("🚿 Вечерняя гигиена"), KeyboardButton("🛏️ Лег в кровать"), 
+        KeyboardButton("📱 Вечерний серфинг"), KeyboardButton("💤 Спать")
+    )
+    keyboard.add(KeyboardButton("📝 Другое"), KeyboardButton("❌ Отмена"))
+    return keyboard
+
 # ========== ОСНОВНОЙ ФУНКЦИОНАЛ ==========
-def handle_activity_start(message, activity_name: str):
+def handle_activity_start(message, activity_name: str, custom_start_time=None):
     user_id = message.from_user.id
-    current_time = datetime.now()
+    current_time = get_moscow_time() if custom_start_time is None else custom_start_time
     
     register_user(user_id, message.from_user.username)
     session = get_user_session(user_id)
     
+    # Если есть текущая активность, сохраняем ее
     if session and session['current_activity'] and session['activity_start']:
         previous_start = datetime.fromisoformat(session['activity_start'])
         save_activity(user_id, session['current_activity'], previous_start, current_time)
@@ -251,38 +268,70 @@ def handle_activity_start(message, activity_name: str):
         seconds = int(duration.total_seconds() % 60)
         bot.send_message(message.chat.id, f"✅ Завершено: {session['current_activity']}\n⏰ Время: {minutes}м {seconds}с")
     
+    # Начинаем новую активность
     update_user_session(user_id, activity_name, current_time)
-    bot.send_message(message.chat.id, f"🔄 Начато: {activity_name}\n🕐 {current_time.strftime('%H:%M:%S')}", reply_markup=main_menu_keyboard())
+    
+    time_display = format_moscow_time(current_time)
+    if custom_start_time:
+        bot.send_message(message.chat.id, f"🔄 Добавлено прошлое действие: {activity_name}\n🕐 Начало: {time_display}", reply_markup=main_menu_keyboard())
+    else:
+        bot.send_message(message.chat.id, f"🔄 Начато: {activity_name}\n🕐 {time_display}", reply_markup=main_menu_keyboard())
 
 # ========== ОБРАБОТЧИКИ КОМАНД ==========
 @bot.message_handler(commands=['start', 'help'])
 def start_command(message):
     register_user(message.from_user.id, message.from_user.username)
+    current_time = format_moscow_time()
     bot.send_message(message.chat.id, 
-        "🏠 Привет! Я бот для учета времени.\n\n"
-        "✅ Работаю 24/7 с защитой от падений!\n"
-        "📝 Есть кнопка 'Другое' для своих активностей!\n"
-        "💾 Автосохранение при перезапуске!\n\n"
-        "Выбирай раздел и начинай отслеживать!",
+        f"🏠 Привет! Я бот для учета времени.\n\n"
+        f"✅ Работаю 24/7 стабильно!\n"
+        f"📝 Есть кнопка 'Другое' для своих активностей!\n"
+        f"⏰ Можно добавлять действия задним числом!\n"
+        f"🕐 Текущее время: {current_time} МСК\n\n"
+        f"Выбирай раздел и начинай отслеживать!",
         reply_markup=main_menu_keyboard()
     )
 
 @bot.message_handler(func=lambda message: message.text == "📋 Главное меню")
 def main_menu(message):
-    if message.from_user.id in user_states: del user_states[message.from_user.id]
+    if message.from_user.id in user_states:
+        del user_states[message.from_user.id]
     bot.send_message(message.chat.id, "📋 Главное меню:", reply_markup=main_menu_keyboard())
 
 @bot.message_handler(func=lambda message: message.text in ["🌅 Утро", "💻 День", "🌙 Вечер"])
 def time_menu(message):
     user_id = message.from_user.id
-    if user_id in user_states: del user_states[user_id]
-    if message.text == "🌅 Утро": bot.send_message(message.chat.id, "🌅 Утренние активности:", reply_markup=morning_keyboard())
-    elif message.text == "💻 День": bot.send_message(message.chat.id, "💻 Дневные активности:", reply_markup=day_keyboard())
-    else: bot.send_message(message.chat.id, "🌙 Вечерние активности:", reply_markup=evening_keyboard())
+    if user_id in user_states: 
+        del user_states[user_id]
+    if message.text == "🌅 Утро": 
+        bot.send_message(message.chat.id, "🌅 Утренние активности:", reply_markup=morning_keyboard())
+    elif message.text == "💻 День": 
+        bot.send_message(message.chat.id, "💻 Дневные активности:", reply_markup=day_keyboard())
+    else: 
+        bot.send_message(message.chat.id, "🌙 Вечерние активности:", reply_markup=evening_keyboard())
+
+@bot.message_handler(func=lambda message: message.text == "⏰ Добавить прошлое действие")
+def add_past_activity(message):
+    """Добавление действия с указанием времени начала"""
+    user_states[message.from_user.id] = "waiting_for_past_activity"
+    current_time = format_moscow_time()
+    bot.send_message(message.chat.id,
+        f"⏰ **Добавление действия задним числом**\n\n"
+        f"Сначала выбери действие из списка ниже.\n"
+        f"Потом я спрошу во сколько ты его начал.\n\n"
+        f"🕐 Текущее время: {current_time} МСК\n\n"
+        f"Выбери действие:",
+        reply_markup=past_activity_keyboard()
+    )
 
 @bot.message_handler(func=lambda message: message.text == "📝 Другое")
 def other_activity(message):
-    user_states[message.from_user.id] = "waiting_for_activity"
+    user_id = message.from_user.id
+    if user_states.get(user_id) == "waiting_for_past_activity":
+        user_states[user_id] = "waiting_for_past_custom_activity"
+    else:
+        user_states[user_id] = "waiting_for_activity"
+        
     bot.send_message(message.chat.id,
         "📝 Напиши свою активность текстом:\nПример: 'Читал книгу', 'Готовил ужин'\nИли '❌ Отмена' для отмены",
         reply_markup=other_activity_keyboard()
@@ -290,16 +339,97 @@ def other_activity(message):
 
 @bot.message_handler(func=lambda message: message.text == "❌ Отмена")
 def cancel_other_activity(message):
-    if message.from_user.id in user_states: del user_states[message.from_user.id]
+    user_id = message.from_user.id
+    if user_id in user_states: 
+        del user_states[user_id]
     bot.send_message(message.chat.id, "❌ Отменено", reply_markup=main_menu_keyboard())
 
+# Обработка выбора действия для прошлого времени
+@bot.message_handler(func=lambda message: message.from_user.id in user_states and user_states[message.from_user.id] == "waiting_for_past_activity")
+def handle_past_activity_selection(message):
+    user_id = message.from_user.id
+    activity_name = message.text.split(' ', 1)[1] if ' ' in message.text else message.text
+    user_states[user_id] = f"waiting_for_past_time:{activity_name}"
+    
+    current_time = format_moscow_time()
+    bot.send_message(message.chat.id,
+        f"🕐 **Во сколько ты начал '{activity_name}'?**\n\n"
+        f"Формат: ЧЧ:ММ или ЧЧ:ММ:СС\n"
+        f"Пример: 14:30 или 14:30:00\n\n"
+        f"Текущее время: {current_time} МСК\n\n"
+        f"Напиши время начала:",
+        reply_markup=other_activity_keyboard()
+    )
+
+# Обработка ввода времени для прошлого действия
+@bot.message_handler(func=lambda message: message.from_user.id in user_states and "waiting_for_past_time:" in user_states[message.from_user.id])
+def handle_past_activity_time(message):
+    user_id = message.from_user.id
+    state = user_states[user_id]
+    activity_name = state.split(':', 1)[1]
+    
+    # Парсим введенное время
+    start_time = parse_time_input(message.text)
+    
+    if start_time is None:
+        bot.send_message(message.chat.id,
+            "❌ Неверный формат времени!\n\n"
+            "Попробуй еще раз:\n"
+            "• 14:30\n• 14:30:00\n• 14.30\n\n"
+            "Напиши время начала:",
+            reply_markup=other_activity_keyboard()
+        )
+        return
+    
+    current_time = get_moscow_time()
+    
+    # Проверяем что время не в будущем
+    if start_time > current_time:
+        bot.send_message(message.chat.id,
+            "❌ Время не может быть в будущем!\n\n"
+            f"Текущее время: {format_moscow_time()}\n"
+            "Напиши корректное время начала:",
+            reply_markup=other_activity_keyboard()
+        )
+        return
+    
+    # Сохраняем активность
+    del user_states[user_id]
+    handle_activity_start(message, activity_name, start_time)
+
+# Обработка кастомной активности для прошлого времени
+@bot.message_handler(func=lambda message: message.from_user.id in user_states and user_states[message.from_user.id] == "waiting_for_past_custom_activity")
+def handle_past_custom_activity(message):
+    user_id = message.from_user.id
+    custom_activity = message.text.strip()
+    
+    if len(custom_activity) > 100:
+        bot.send_message(message.chat.id, "❌ Слишком длинное название", reply_markup=other_activity_keyboard())
+        return
+    
+    formatted_activity = f"Другое: {custom_activity}"
+    user_states[user_id] = f"waiting_for_past_time:{formatted_activity}"
+    
+    current_time = format_moscow_time()
+    bot.send_message(message.chat.id,
+        f"🕐 **Во сколько ты начал '{custom_activity}'?**\n\n"
+        f"Формат: ЧЧ:ММ или ЧЧ:ММ:СС\n"
+        f"Пример: 14:30 или 14:30:00\n\n"
+        f"Текущее время: {current_time} МСК\n\n"
+        f"Напиши время начала:",
+        reply_markup=other_activity_keyboard()
+    )
+
+# Обработка обычной кастомной активности
 @bot.message_handler(func=lambda message: message.from_user.id in user_states and user_states[message.from_user.id] == "waiting_for_activity")
 def handle_custom_activity(message):
     user_id = message.from_user.id
     custom_activity = message.text.strip()
+    
     if len(custom_activity) > 100:
         bot.send_message(message.chat.id, "❌ Слишком длинное название", reply_markup=other_activity_keyboard())
         return
+    
     formatted_activity = f"Другое: {custom_activity}"
     del user_states[user_id]
     handle_activity_start(message, formatted_activity)
@@ -347,7 +477,7 @@ def show_statistics(message):
         bot.send_message(message.chat.id, "❌ Ошибка статистики")
     finally: cur.close(); conn.close()
 
-# Обработчики стандартных активностей
+# Обработчики стандартных активностей (обычный режим)
 activities = [
     "⏰ Проснулся", "📱 Полистал ленту", "🚽 В туалет", "🚿 Гигиена", 
     "🍳 Завтрак", "👔 Одеваюсь", "🎒 Выхожу на учебу", "🏠 Домой", 
@@ -359,29 +489,52 @@ activities = [
 for activity in activities:
     @bot.message_handler(func=lambda message, act=activity: message.text == act)
     def activity_handler(message, act=activity):
+        # Проверяем не в режиме ли добавления прошлого действия
+        user_id = message.from_user.id
+        if user_states.get(user_id) == "waiting_for_past_activity":
+            # Это выбор действия для прошлого времени - обрабатывается в другом обработчике
+            return
+        
         clean_activity = act.split(' ', 1)[1] if ' ' in act else act
         handle_activity_start(message, clean_activity)
 
-# ========== ЗАПУСК БОТА С ЗАЩИТОЙ ==========
-def run_bot():
-    """Запуск бота с защитой от падений"""
+# ========== FLASK СЕРВЕР ДЛЯ RENDER ==========
+@app.route('/')
+def home():
+    return "🤖 Time Tracker Bot is running!"
+
+@app.route('/health')
+def health():
+    return jsonify({"status": "ok", "time": datetime.now().isoformat()})
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    if request.headers.get('content-type') == 'application/json':
+        json_string = request.get_data().decode('utf-8')
+        update = telebot.types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return ''
+    return 'Invalid content type', 400
+
+def run_bot_polling():
     init_db()
-    logger.info("🚀 Starting bot with crash protection...")
+    logger.info("🚀 Starting bot polling in background...")
     
     while True:
         try:
-            logger.info("🤖 Bot polling started...")
             bot.infinity_polling(timeout=30, long_polling_timeout=10)
         except Exception as e:
-            if "Conflict" in str(e) or "409" in str(e):
-                logger.warning("⚠️ Another instance detected, waiting 60s...")
-                time.sleep(60)
-            else:
-                logger.error(f"❌ Bot error: {e}")
-                # Сохраняем активные сессии при ошибке
-                save_current_activity_on_exit()
-            logger.info("🔄 Restarting in 15 seconds...")
+            logger.error(f"❌ Bot polling error: {e}")
             time.sleep(15)
 
+def run_flask():
+    logger.info(f"🌐 Starting Flask server on port {PORT}...")
+    app.run(host='0.0.0.0', port=PORT, debug=False)
+
 if __name__ == "__main__":
-    run_bot()
+    # Запускаем бот в фоновом потоке
+    bot_thread = threading.Thread(target=run_bot_polling, daemon=True)
+    bot_thread.start()
+    
+    # Запускаем Flask в основном потоке
+    run_flask()
