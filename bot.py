@@ -8,6 +8,7 @@ import time
 import threading
 from flask import Flask, request, jsonify
 import pytz
+import requests
 
 # Настройка логирования
 logging.basicConfig(
@@ -508,6 +509,11 @@ def home():
 def health():
     return jsonify({"status": "ok", "time": datetime.now().isoformat()})
 
+@app.route('/ping')
+def ping():
+    """Специальный endpoint для пинга"""
+    return jsonify({"status": "pong", "timestamp": datetime.now().isoformat()})
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
     if request.headers.get('content-type') == 'application/json':
@@ -528,11 +534,32 @@ def set_webhook():
         except Exception as e:
             logger.error(f"❌ Webhook setup error: {e}")
 
+def keep_alive_ping():
+    """Фоновая задача для пинга сервиса каждые 10 минут"""
+    while True:
+        try:
+            if WEBHOOK_URL:
+                response = requests.get(f"{WEBHOOK_URL}/ping", timeout=10)
+                logger.info(f"✅ Keep-alive ping sent: {response.status_code}")
+            else:
+                logger.info("🔄 Keep-alive: service is running")
+        except Exception as e:
+            logger.error(f"❌ Keep-alive ping failed: {e}")
+        
+        # Ждем 10 минут (600 секунд) до следующего пинга
+        time.sleep(600)
+
 def run_flask():
     """Запускает Flask сервер"""
     logger.info(f"🌐 Starting Flask server on port {PORT}...")
     init_db()
     set_webhook()
+    
+    # Запускаем фоновую задачу для keep-alive пингов
+    ping_thread = threading.Thread(target=keep_alive_ping, daemon=True)
+    ping_thread.start()
+    logger.info("✅ Keep-alive ping thread started")
+    
     app.run(host='0.0.0.0', port=PORT, debug=False)
 
 if __name__ == "__main__":

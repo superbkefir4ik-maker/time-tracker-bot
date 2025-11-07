@@ -12,4 +12,4 @@ services:
         fromService:
           type: web
           name: time-tracker-bot
-          property: urleg
+          property: url
