@@ -102,6 +102,12 @@ def format_moscow_time(dt=None):
         dt = MOSCOW_TZ.localize(dt)
     return dt.strftime('%H:%M:%S')
 
+def format_time_short(dt):
+    """Форматирует время в короткий формат (ЧЧ:ММ)"""
+    if dt.tzinfo is None:
+        dt = MOSCOW_TZ.localize(dt)
+    return dt.strftime('%H:%M')
+
 def parse_time_input(time_str):
     """Парсит ввод времени пользователя"""
     try:
@@ -194,6 +200,106 @@ def get_user_session(user_id: int):
     except: return None
     finally: cur.close(); conn.close()
 
+def get_detailed_statistics(user_id: int):
+    """Получает детальную статистику с промежутками времени"""
+    conn = get_db_connection()
+    if not conn: return None
+    
+    cur = conn.cursor()
+    try:
+        # Получаем все активности за сегодня с временными промежутками
+        cur.execute('''
+            SELECT activity_name, start_time, end_time, duration 
+            FROM activities 
+            WHERE user_id = ? AND DATE(start_time) = DATE("now", "localtime")
+            ORDER BY start_time
+        ''', (user_id,))
+        
+        activities = cur.fetchall()
+        
+        # Получаем общее время
+        cur.execute('''
+            SELECT SUM(duration) as total_time 
+            FROM activities 
+            WHERE user_id = ? AND DATE(start_time) = DATE("now", "localtime")
+        ''', (user_id,))
+        
+        total_time = cur.fetchone()['total_time'] or 0
+        
+        return activities, total_time
+        
+    except Exception as e:
+        logger.error(f"Detailed stats error: {e}")
+        return None, 0
+    finally: 
+        cur.close()
+        conn.close()
+
+def format_detailed_statistics(user_id: int):
+    """Форматирует детальную статистику для отправки"""
+    activities, total_time = get_detailed_statistics(user_id)
+    
+    if not activities:
+        return "📊 За сегодня еще нет активностей"
+    
+    # Текущая дата
+    today = get_moscow_time().strftime('%d.%m.%Y')
+    
+    stats_text = f"📊 **Детальная статистика за {today}**\n\n"
+    
+    # Группируем активности по имени для суммарного времени
+    activity_totals = {}
+    for activity in activities:
+        name = activity['activity_name'].replace("Другое: ", "")
+        if name not in activity_totals:
+            activity_totals[name] = 0
+        activity_totals[name] += activity['duration']
+    
+    # Выводим суммарное время по активностям
+    stats_text += "**🕐 Суммарное время:**\n"
+    for activity_name, total_duration in sorted(activity_totals.items(), key=lambda x: x[1], reverse=True):
+        minutes = int(total_duration // 60)
+        hours = int(minutes // 60)
+        remaining_minutes = minutes % 60
+        
+        if hours > 0:
+            time_str = f"{hours}ч {remaining_minutes}м"
+        else:
+            time_str = f"{minutes}м"
+            
+        stats_text += f"• {activity_name}: {time_str}\n"
+    
+    stats_text += "\n**📅 Детали по промежуткам:**\n"
+    
+    # Выводим детальные промежутки
+    current_date = None
+    for activity in activities:
+        start_time = datetime.fromisoformat(activity['start_time'])
+        end_time = datetime.fromisoformat(activity['end_time'])
+        
+        # Форматируем время
+        start_str = format_time_short(start_time)
+        end_str = format_time_short(end_time)
+        
+        activity_name = activity['activity_name'].replace("Другое: ", "")
+        duration_minutes = int(activity['duration'] // 60)
+        
+        stats_text += f"• {start_str} - {end_str}: {activity_name} ({duration_minutes}м)\n"
+    
+    # Общее время
+    total_minutes = int(total_time // 60)
+    total_hours = int(total_minutes // 60)
+    remaining_minutes = total_minutes % 60
+    
+    if total_hours > 0:
+        total_time_str = f"{total_hours}ч {remaining_minutes}м"
+    else:
+        total_time_str = f"{total_minutes}м"
+    
+    stats_text += f"\n**🎯 Итого за день: {total_time_str}**"
+    
+    return stats_text
+
 # ========== КЛАВИАТУРЫ ==========
 def main_menu_keyboard():
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
@@ -279,6 +385,33 @@ def handle_activity_start(message, activity_name: str, custom_start_time=None):
     else:
         bot.send_message(message.chat.id, f"🔄 Начато: {activity_name}\n🕐 {time_display}", reply_markup=main_menu_keyboard())
 
+def handle_sleep_activity(message):
+    """Обработка кнопки Спать с отправкой статистики"""
+    user_id = message.from_user.id
+    current_time = get_moscow_time()
+    
+    register_user(user_id, message.from_user.username)
+    session = get_user_session(user_id)
+    
+    # Если есть текущая активность, сохраняем ее
+    if session and session['current_activity'] and session['activity_start']:
+        previous_start = datetime.fromisoformat(session['activity_start'])
+        save_activity(user_id, session['current_activity'], previous_start, current_time)
+        duration = current_time - previous_start
+        minutes = int(duration.total_seconds() // 60)
+        seconds = int(duration.total_seconds() % 60)
+        bot.send_message(message.chat.id, f"✅ Завершено: {session['current_activity']}\n⏰ Время: {minutes}м {seconds}с")
+    
+    # Начинаем активность "Спать"
+    update_user_session(user_id, "Спать", current_time)
+    
+    time_display = format_moscow_time(current_time)
+    bot.send_message(message.chat.id, f"💤 Начато: Спать\n🕐 {time_display}")
+    
+    # Отправляем детальную статистику за день
+    stats_text = format_detailed_statistics(user_id)
+    bot.send_message(message.chat.id, stats_text)
+
 # ========== ОБРАБОТЧИКИ КОМАНД ==========
 @bot.message_handler(commands=['start', 'help'])
 def start_command(message):
@@ -289,6 +422,7 @@ def start_command(message):
         f"✅ Работаю 24/7 стабильно!\n"
         f"📝 Есть кнопка 'Другое' для своих активностей!\n"
         f"⏰ Можно добавлять действия задним числом!\n"
+        f"📊 При нажатии 'Спать' получишь детальную статистику за день!\n"
         f"🕐 Текущее время: {current_time} МСК\n\n"
         f"Выбирай раздел и начинай отслеживать!",
         reply_markup=main_menu_keyboard()
@@ -438,54 +572,18 @@ def handle_custom_activity(message):
 
 @bot.message_handler(func=lambda message: message.text == "📊 Статистика")
 def show_statistics(message):
+    """Показывает детальную статистику по запросу"""
     user_id = message.from_user.id
-    conn = get_db_connection()
-    if not conn:
-        bot.send_message(message.chat.id, "❌ Ошибка базы")
-        return
-    cur = conn.cursor()
-    try:
-        cur.execute('SELECT category, SUM(duration) as total_time FROM activities WHERE user_id = ? AND DATE(start_time) = DATE("now") GROUP BY category ORDER BY total_time DESC', (user_id,))
-        stats = cur.fetchall()
-        if not stats:
-            bot.send_message(message.chat.id, "📊 Сегодня еще нет активностей")
-            return
-        stats_text = "📊 **Статистика за сегодня:**\n\n"
-        total_seconds = 0
-        for category, total_time in stats:
-            if total_time:
-                seconds = total_time
-                minutes = int(seconds // 60)
-                hours = int(minutes // 60)
-                remaining_minutes = minutes % 60
-                total_seconds += seconds
-                stats_text += f"• **{category}**: {hours}ч {remaining_minutes}м\n" if hours > 0 else f"• **{category}**: {minutes}м\n"
-        total_minutes = int(total_seconds // 60)
-        total_hours = int(total_minutes // 60)
-        remaining_minutes = total_minutes % 60
-        stats_text += f"\n🕐 **Всего времени**: {total_hours}ч {remaining_minutes}м" if total_hours > 0 else f"\n🕐 **Всего времени**: {total_minutes}м"
-        cur.execute('SELECT activity_name, SUM(duration) as total_time FROM activities WHERE user_id = ? AND category = "Другое" AND DATE(start_time) = DATE("now") GROUP BY activity_name ORDER BY total_time DESC', (user_id,))
-        other_activities = cur.fetchall()
-        if other_activities:
-            stats_text += "\n\n**📝 Свои активности:**\n"
-            for activity, duration in other_activities:
-                if duration:
-                    minutes = int(duration // 60)
-                    activity_name = activity.replace("Другое: ", "")
-                    stats_text += f"• {activity_name}: {minutes}м\n"
-        bot.send_message(message.chat.id, stats_text)
-    except Exception as e:
-        logger.error(f"Stats error: {e}")
-        bot.send_message(message.chat.id, "❌ Ошибка статистики")
-    finally: cur.close(); conn.close()
+    stats_text = format_detailed_statistics(user_id)
+    bot.send_message(message.chat.id, stats_text)
 
-# Обработчики стандартных активностей (обычный режим)
+# Обработчики стандартных активностей
 activities = [
     "⏰ Проснулся", "📱 Полистал ленту", "🚽 В туалет", "🚿 Гигиена", 
     "🍳 Завтрак", "👔 Одеваюсь", "🎒 Выхожу на учебу", "🏠 Домой", 
     "💻 Сесть за комп", "🎮 Игры", "📚 Учеба/ДЗ", "🍽️ Обед/Ужин", 
     "📺 Отдых", "🧹 Уборка", "🚶 Иду гулять", "👨‍👩‍👧‍👦 Время с близкими",
-    "🚿 Вечерняя гигиена", "🛏️ Лег в кровать", "📱 Вечерний серфинг", "💤 Спать"
+    "🚿 Вечерняя гигиена", "🛏️ Лег в кровать", "📱 Вечерний серфинг"
 ]
 
 for activity in activities:
@@ -499,6 +597,11 @@ for activity in activities:
         
         clean_activity = act.split(' ', 1)[1] if ' ' in act else act
         handle_activity_start(message, clean_activity)
+
+# Специальный обработчик для кнопки "Спать"
+@bot.message_handler(func=lambda message: message.text == "💤 Спать")
+def sleep_handler(message):
+    handle_sleep_activity(message)
 
 # ========== FLASK СЕРВЕР ДЛЯ RENDER ==========
 @app.route('/')
@@ -535,19 +638,30 @@ def set_webhook():
             logger.error(f"❌ Webhook setup error: {e}")
 
 def keep_alive_ping():
-    """Фоновая задача для пинга сервиса каждые 10 минут"""
+    """Фоновая задача для пинга сервиса каждые 5 минут"""
+    # Ждем 30 секунд после запуска чтобы сервер точно поднялся
+    time.sleep(30)
+    
     while True:
         try:
             if WEBHOOK_URL:
                 response = requests.get(f"{WEBHOOK_URL}/ping", timeout=10)
                 logger.info(f"✅ Keep-alive ping sent: {response.status_code}")
             else:
-                logger.info("🔄 Keep-alive: service is running")
+                # Если нет WEBHOOK_URL, пингуем health endpoint
+                import socket
+                host = socket.gethostname()
+                local_url = f"http://{host}:{PORT}/health"
+                try:
+                    response = requests.get(local_url, timeout=5)
+                    logger.info(f"🔄 Local health check: {response.status_code}")
+                except:
+                    logger.info("🔧 Service starting up...")
         except Exception as e:
             logger.error(f"❌ Keep-alive ping failed: {e}")
         
-        # Ждем 10 минут (600 секунд) до следующего пинга
-        time.sleep(600)
+        # Ждем 4 минуты (240 секунд) до следующего пинга
+        time.sleep(240)
 
 def run_flask():
     """Запускает Flask сервер"""
